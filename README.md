@@ -1,6 +1,10 @@
 <img src="https://github.com/nwg-piotr/nwg-displays/assets/20579136/b7c31822-8846-44be-8028-af3f3af4acd8" width="90" style="margin-right:10px" align=left alt="nwg-shell logo">
 <H1>nwg-displays</H1><br>
 
+> [!NOTE]
+> **This is an enhanced fork by [zfzfg](https://github.com/zfzfg/nwg-displays) featuring modular Hyprland Lua support (e.g. CachyOS), HDR property preservation (`sdr_max_luminance`), live compositor applying, and responsive Wayland canvas dragging.**
+> Full technical documentation is available in **[FORK_DETAILS.md](FORK_DETAILS.md)**.
+
 This application is a part of the [nwg-shell](https://nwg-piotr.github.io/nwg-shell) project.
 
 **Nwg-displays** is an output management utility for [sway](https://github.com/swaywm/sway), [Hyprland](https://github.com/hyprwm/Hyprland) and [Niri](https://github.com/niri-wm/niri)
