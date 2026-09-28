@@ -164,14 +164,30 @@ fixed = Gtk.Fixed()
 
 SENSITIVITY = 1
 
-EvMask = Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON1_MOTION_MASK
+EvMask = (
+    Gdk.EventMask.BUTTON_PRESS_MASK
+    | Gdk.EventMask.BUTTON_RELEASE_MASK
+    | Gdk.EventMask.BUTTON1_MOTION_MASK
+)
 
-offset_x = 0
-offset_y = 0
-px = 0
-py = 0
-max_x = 0
-max_y = 0
+is_dragging = False
+updating_form = False
+grab_offset_x = 0
+grab_offset_y = 0
+px = -1
+py = -1
+
+
+def update_canvas_size():
+    max_right = 0
+    max_bottom = 0
+    for b in display_buttons:
+        max_right = max(max_right, (b.x + b.logical_width) * config["view-scale"])
+        max_bottom = max(max_bottom, (b.y + b.logical_height) * config["view-scale"])
+
+    canvas_w = max(1200, int(max_right + 400))
+    canvas_h = max(500, int(max_bottom + 250))
+    fixed.set_size_request(canvas_w, canvas_h)
 
 voc = {}
 
@@ -220,192 +236,207 @@ def on_button_press_event(widget, event):
             else:
                 db.unselect()
 
-        p = widget.get_parent()
-        # offset == distance of parent widget from edge of screen ...
-        global offset_x, offset_y
-        offset_x, offset_y = p.get_window().get_position()
-        # plus distance from pointer to edge of widget
-        offset_x += event.x
-        offset_y += event.y
-        # max_x, max_y both relative to the parent
-        # note that we're rounding down now so that these max values don't get
-        # rounded upward later and push the widget off the edge of its parent.
-        global max_x, max_y
-        max_x = round_down_to_multiple(
-            p.get_allocation().width - widget.get_allocation().width, SENSITIVITY
-        )
-        max_y = round_down_to_multiple(
-            p.get_allocation().height - widget.get_allocation().height, SENSITIVITY
-        )
+        global is_dragging, grab_offset_x, grab_offset_y, px, py
+        is_dragging = True
+        grab_offset_x = event.x
+        grab_offset_y = event.y
+        px = -1
+        py = -1
 
         update_form_from_widget(widget)
 
 
+def on_button_release_event(widget, event):
+    global is_dragging
+    if event.button == 1:
+        is_dragging = False
+        fixed.move(
+            widget,
+            int(round(widget.x * config["view-scale"])),
+            int(round(widget.y * config["view-scale"])),
+        )
+        update_form_from_widget(widget)
+        update_canvas_size()
+
+
 def on_motion_notify_event(widget, event):
-    # x_root,x_root relative to screen
-    # x,y relative to parent (fixed widget)
-    # px,py stores previous values of x,y
+    global is_dragging, grab_offset_x, grab_offset_y, px, py, updating_form
+    if not is_dragging:
+        return
 
-    global px, py
+    coords = widget.translate_coordinates(fixed, event.x, event.y)
+    if not coords:
+        return
 
-    # get starting values for x,y
-    x = event.x_root - offset_x
-    y = event.y_root - offset_y
-    # make sure the potential coordinates x,y:
-    #   1) will not push any part of the widget outside of its parent container
-    #   2) is a multiple of SENSITIVITY
-    x = round_to_nearest_multiple(max_val(min_val(x, max_x), 0), SENSITIVITY)
-    y = round_to_nearest_multiple(max_val(min_val(y, max_y), 0), SENSITIVITY)
+    fixed_mouse_x, fixed_mouse_y = coords
+    raw_x = fixed_mouse_x - grab_offset_x
+    raw_y = fixed_mouse_y - grab_offset_y
+
+    # Prevent moving outside top/left
+    x = max_val(raw_x, 0)
+    y = max_val(raw_y, 0)
+
+    # Dynamic upper bound
+    p = widget.get_parent()
+    p_alloc = p.get_allocation() if p else None
+    alloc_w = p_alloc.width if p_alloc and p_alloc.width > 0 else 2000
+    alloc_h = p_alloc.height if p_alloc and p_alloc.height > 0 else 1000
+    max_bound_x = max(alloc_w - widget.get_allocation().width, 3000)
+    max_bound_y = max(alloc_h - widget.get_allocation().height, 2000)
+
+    x = min_val(x, max_bound_x)
+    y = min_val(y, max_bound_y)
+
+    x = round_to_nearest_multiple(x, SENSITIVITY)
+    y = round_to_nearest_multiple(y, SENSITIVITY)
 
     if x != px or y != py:
         px = x
         py = y
-        snap_x, snap_y = [0], [0]
+
+        snap_x = [0]
+        snap_y = [0]
         # Collect snap lines from other displays
         for db in display_buttons:
             if db.name == widget.name:
                 continue
 
             val = db.x * config["view-scale"]
-            if val not in snap_x:
-                snap_x.append(val)
+            snap_x.append(val)
 
             val = (db.x + db.logical_width) * config["view-scale"]
-            if val not in snap_x:
-                snap_x.append(val)
+            snap_x.append(val)
 
             val = db.y * config["view-scale"]
-            if val not in snap_y:
-                snap_y.append(val)
+            snap_y.append(val)
 
             val = (db.y + db.logical_height) * config["view-scale"]
-            if val not in snap_y:
-                snap_y.append(val)
+            snap_y.append(val)
 
-        snap_h, snap_v = None, None
-        # Find nearest horizontal snap line
-        for value in snap_x:
-            if abs(x - value) < snap_threshold_scaled:
-                snap_h = value
-                break
+        w = widget.logical_width * config["view-scale"]
+        h = widget.logical_height * config["view-scale"]
 
-        for value in snap_x:
-            w = widget.logical_width * config["view-scale"]
-            if abs(w + x - value) < snap_threshold_scaled:
-                snap_h = value - w
-                break
+        threshold = snap_threshold_scaled if snap_threshold_scaled is not None else 10
 
-        # Find nearest vertical snap line
-        for value in snap_y:
-            if abs(y - value) < snap_threshold_scaled:
-                snap_v = value
-                break
+        best_snap_x = None
+        min_dist_x = threshold
 
-        for value in snap_y:
-            h = widget.logical_height * config["view-scale"]
-            if abs(h + y - value) < snap_threshold_scaled:
-                snap_v = value - h
-                break
+        for val in snap_x:
+            # Snap left edge of widget to line
+            dist = abs(x - val)
+            if dist < min_dist_x:
+                min_dist_x = dist
+                best_snap_x = val
+            # Snap right edge of widget to line
+            dist = abs((x + w) - val)
+            if dist < min_dist_x:
+                min_dist_x = dist
+                best_snap_x = val - w
 
-        # Just in case ;)
-        if snap_h and snap_h < 0:
-            snap_h = 0
+        best_snap_y = None
+        min_dist_y = threshold
 
-        if snap_v and snap_v < 0:
-            snap_v = 0
+        for val in snap_y:
+            # Snap top edge of widget to line
+            dist = abs(y - val)
+            if dist < min_dist_y:
+                min_dist_y = dist
+                best_snap_y = val
+            # Snap bottom edge of widget to line
+            dist = abs((y + h) - val)
+            if dist < min_dist_y:
+                min_dist_y = dist
+                best_snap_y = val - h
 
-        if snap_h is None and snap_v is None:
-            fixed.move(widget, x, y)
-            widget.x = round(x / config["view-scale"])
-            widget.y = round(y / config["view-scale"])
-        else:
+        final_x = max_val(best_snap_x if best_snap_x is not None else x, 0)
+        final_y = max_val(best_snap_y if best_snap_y is not None else y, 0)
 
-            if snap_h is not None and snap_v is not None:
-                fixed.move(widget, snap_h, snap_v)
-                widget.x = round(snap_h / config["view-scale"])
-                widget.y = round(snap_v / config["view-scale"])
+        fixed.move(widget, int(final_x), int(final_y))
+        widget.x = round(final_x / config["view-scale"])
+        widget.y = round(final_y / config["view-scale"])
 
-            elif snap_h is not None:
-                fixed.move(widget, snap_h, y)
-                widget.x = round(snap_h / config["view-scale"])
-                widget.y = round(y / config["view-scale"])
-
-            elif snap_v is not None:
-                fixed.move(widget, x, snap_v)
-                widget.x = round(x / config["view-scale"])
-                widget.y = round(snap_v / config["view-scale"])
-
-    update_form_from_widget(widget)
+        # Update position spinbuttons during drag without triggering recursive callbacks
+        updating_form = True
+        try:
+            form_x.set_value(widget.x)
+            form_y.set_value(widget.y)
+        finally:
+            updating_form = False
 
 
 def update_form_from_widget(widget):
-    form_name.set_text(widget.name)
-    if len(widget.description) > 48:
-        form_description.set_text(f"{widget.description[:47]}(…)")
-    else:
-        form_description.set_text(widget.description)
-    form_dpms.set_active(widget.dpms)
-    form_adaptive_sync.set_active(widget.adaptive_sync)
-    form_custom_mode.set_active(widget.custom_mode)
-    form_view_scale.set_value(
-        config["view-scale"]
-    )  # not really from the widget, but from the global value
-    if form_profile_wallpapers:
-        form_profile_wallpapers.set_active(config.get("profile-bound-wallpapers", True))
-    form_use_desc.set_active(config["use-desc"])
-    form_x.set_value(widget.x)
-    form_y.set_value(widget.y)
-    form_width.set_value(widget.physical_width)
-    form_height.set_value(widget.physical_height)
-    form_scale.set_value(widget.scale)
-    form_scale_filter.set_active_id(widget.scale_filter)
-    form_refresh.set_value(widget.refresh)
-    if form_ten_bit:
-        form_ten_bit.set_active(widget.ten_bit)
-    if form_color_mode:
-        form_color_mode.set_active_id(widget.color_mode if widget.color_mode else "")
-        update_color_dependent_widgets(widget.color_mode)
-    if form_sdr_brightness:
-        form_sdr_brightness.set_value(widget.sdr_brightness)
-    if form_sdr_saturation:
-        form_sdr_saturation.set_value(widget.sdr_saturation)
-    if form_mirror:
-        form_mirror.remove_all()
-        form_mirror.append("", voc["none"])
-        for key in outputs:
-            if key != widget.name:
-                form_mirror.append(key, key)
-        form_mirror.set_active_id(widget.mirror)
-        form_mirror.show_all()
+    global updating_form
+    updating_form = True
+    try:
+        form_name.set_text(widget.name)
+        if len(widget.description) > 48:
+            form_description.set_text(f"{widget.description[:47]}(…)")
+        else:
+            form_description.set_text(widget.description)
+        form_dpms.set_active(widget.dpms)
+        form_adaptive_sync.set_active(widget.adaptive_sync)
+        form_custom_mode.set_active(widget.custom_mode)
+        form_view_scale.set_value(
+            config["view-scale"]
+        )  # not really from the widget, but from the global value
+        if form_profile_wallpapers:
+            form_profile_wallpapers.set_active(config.get("profile-bound-wallpapers", True))
+        form_use_desc.set_active(config["use-desc"])
+        form_x.set_value(widget.x)
+        form_y.set_value(widget.y)
+        form_width.set_value(widget.physical_width)
+        form_height.set_value(widget.physical_height)
+        form_scale.set_value(widget.scale)
+        form_scale_filter.set_active_id(widget.scale_filter)
+        form_refresh.set_value(widget.refresh)
+        if form_ten_bit:
+            form_ten_bit.set_active(widget.ten_bit)
+        if form_color_mode:
+            form_color_mode.set_active_id(widget.color_mode if widget.color_mode else "")
+            update_color_dependent_widgets(widget.color_mode)
+        if form_sdr_brightness:
+            form_sdr_brightness.set_value(widget.sdr_brightness)
+        if form_sdr_saturation:
+            form_sdr_saturation.set_value(widget.sdr_saturation)
+        if form_mirror:
+            form_mirror.remove_all()
+            form_mirror.append("", voc["none"])
+            for key in outputs:
+                if key != widget.name:
+                    form_mirror.append(key, key)
+            form_mirror.set_active_id(widget.mirror)
+            form_mirror.show_all()
 
-    global on_mode_changed_silent
-    on_mode_changed_silent = True
+        global on_mode_changed_silent
+        on_mode_changed_silent = True
 
-    form_modes.remove_all()
-    active = ""
-    for mode in widget.modes:
-        m = "{}x{}@{}Hz".format(
-            mode["width"],
-            mode["height"],
-            mode["refresh"] / 1000,
-            mode["refresh"] / 1000,
-            widget.refresh,
-        )
-        form_modes.append(m, m)
-        # This is just to set active_id
+        form_modes.remove_all()
+        active = ""
+        for mode in widget.modes:
+            m = "{}x{}@{}Hz".format(
+                mode["width"],
+                mode["height"],
+                mode["refresh"] / 1000,
+                mode["refresh"] / 1000,
+                widget.refresh,
+            )
+            form_modes.append(m, m)
+            # This is just to set active_id
 
-        if (
-            mode["width"] == widget.physical_width
-            and mode["height"] == widget.physical_height
-            and mode["refresh"] / 1000 == widget.refresh
-        ):
-            active = m
-    if active:
-        form_modes.set_active_id(active)
+            if (
+                mode["width"] == widget.physical_width
+                and mode["height"] == widget.physical_height
+                and mode["refresh"] / 1000 == widget.refresh
+            ):
+                active = m
+        if active:
+            form_modes.set_active_id(active)
 
-    form_transform.set_active_id(widget.transform)
+        form_transform.set_active_id(widget.transform)
 
-    on_mode_changed_silent = False
+        on_mode_changed_silent = False
+    finally:
+        updating_form = False
 
 
 class DisplayButton(Gtk.Button):
@@ -472,6 +503,7 @@ class DisplayButton(Gtk.Button):
         self.set_can_focus(False)
         self.set_events(EvMask)
         self.connect("button_press_event", on_button_press_event)
+        self.connect("button_release_event", on_button_release_event)
         self.connect("motion_notify_event", on_motion_notify_event)
         self.set_always_show_image(True)
         self.set_label(self.name)
@@ -538,8 +570,13 @@ def on_view_scale_changed(*args):
 
     for b in display_buttons:
         b.rescale_transform()
-        fixed.move(b, b.x * config["view-scale"], b.y * config["view-scale"])
+        fixed.move(
+            b,
+            int(round(b.x * config["view-scale"])),
+            int(round(b.y * config["view-scale"])),
+        )
 
+    update_canvas_size()
     save_json(config, os.path.join(config_dir, "config"))
 
 
@@ -549,13 +586,18 @@ def on_profile_wallpapers_toggled(widget):
 
 
 def on_transform_changed(*args):
+    if updating_form:
+        return
     if selected_output_button:
         transform = form_transform.get_active_id()
         selected_output_button.transform = transform
         selected_output_button.rescale_transform()
+        update_canvas_size()
 
 
 def on_ten_bit_toggled(check_btn):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.ten_bit = check_btn.get_active()
 
@@ -579,6 +621,8 @@ def update_color_dependent_widgets(color_mode):
 
 
 def on_color_mode_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         color_mode = widget.get_active_id() or ""
         selected_output_button.color_mode = color_mode
@@ -586,31 +630,43 @@ def on_color_mode_changed(widget):
 
 
 def on_sdr_brightness_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.sdr_brightness = round(widget.get_value(), 2)
 
 
 def on_sdr_saturation_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.sdr_saturation = round(widget.get_value(), 2)
 
 
 def on_dpms_toggled(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.dpms = widget.get_active()
 
 
 def on_use_desc_toggled(widget):
+    if updating_form:
+        return
     config["use-desc"] = widget.get_active()
     save_json(config, os.path.join(config_dir, "config"))
 
 
 def on_adaptive_sync_toggled(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.adaptive_sync = widget.get_active()
 
 
 def on_custom_mode_toggle(widget):
+    if updating_form:
+        return
     if selected_output_button:
         outputs = set(config["custom-mode"])
         turned_on = widget.get_active()
@@ -623,67 +679,89 @@ def on_custom_mode_toggle(widget):
 
 
 def on_pos_x_changed(widget):
+    if updating_form or is_dragging:
+        return
     if selected_output_button:
         selected_output_button.x = round(widget.get_value())
         fixed.move(
             selected_output_button,
-            selected_output_button.x * config["view-scale"],
-            selected_output_button.y * config["view-scale"],
+            int(round(selected_output_button.x * config["view-scale"])),
+            int(round(selected_output_button.y * config["view-scale"])),
         )
+        update_canvas_size()
 
 
 def on_pos_y_changed(widget):
+    if updating_form or is_dragging:
+        return
     if selected_output_button:
         selected_output_button.y = round(widget.get_value())
         fixed.move(
             selected_output_button,
-            selected_output_button.x * config["view-scale"],
-            selected_output_button.y * config["view-scale"],
+            int(round(selected_output_button.x * config["view-scale"])),
+            int(round(selected_output_button.y * config["view-scale"])),
         )
+        update_canvas_size()
 
 
 def on_width_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.physical_width = round(widget.get_value())
         selected_output_button.rescale_transform()
+        update_canvas_size()
 
 
 def on_height_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.physical_height = round(widget.get_value())
         selected_output_button.rescale_transform()
+        update_canvas_size()
 
 
 def on_scale_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.scale = widget.get_value()
         selected_output_button.rescale_transform()
+        update_canvas_size()
 
 
 def on_scale_filter_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.scale_filter = widget.get_active_id()
 
 
 def on_refresh_changed(widget):
+    if updating_form:
+        return
     if selected_output_button:
         selected_output_button.refresh = widget.get_value()
-
         update_form_from_widget(selected_output_button)
 
 
 def on_mode_changed(widget):
+    if updating_form:
+        return
     if selected_output_button and not on_mode_changed_silent:
         mode = selected_output_button.modes[widget.get_active()]
         selected_output_button.physical_width = mode["width"]
         selected_output_button.physical_height = mode["height"]
         selected_output_button.refresh = mode["refresh"] / 1000
         selected_output_button.rescale_transform()
-
         update_form_from_widget(selected_output_button)
+        update_canvas_size()
 
 
 def on_mirror_selected(widget):
+    if updating_form:
+        return
     if selected_output_button and widget.get_active_id() is not None:
         selected_output_button.mirror = widget.get_active_id()
 
@@ -773,6 +851,8 @@ def create_display_buttons():
             round(item["x"] * config["view-scale"]),
             round(item["y"] * config["view-scale"]),
         )
+
+    update_canvas_size()
 
     if display_buttons:
         display_buttons[0].select()
@@ -1519,9 +1599,15 @@ def main():
 
     wrapper = builder.get_object("wrapper")
     wrapper.set_property("name", "wrapper")
+    if wrapper.get_parent():
+        wrapper.get_parent().child_set_property(wrapper, "expand", True)
+    wrapper.set_vexpand(True)
+    wrapper.set_hexpand(True)
 
     global fixed
     fixed = builder.get_object("fixed")
+    fixed.set_vexpand(True)
+    fixed.set_hexpand(True)
 
     create_display_buttons()
 
@@ -1694,6 +1780,7 @@ def main():
     css = b""" #popup { border-radius: 6px; border: solid 1px; border-color: #f00 } """
     provider.load_from_data(css)
 
+    window.set_default_size(1200, 750)
     window.show_all()
 
     # Gtk.Fixed does not respect expand properties. That's why we need
