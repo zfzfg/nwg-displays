@@ -15,6 +15,7 @@ from nwg_displays.tools import (
     inactive_output_description,
     load_json,
     save_json,
+    notify,
 )
 from nwg_displays.tools import get_config, get_config_home
 from nwg_displays.hyprland_helper import (
@@ -56,13 +57,21 @@ class SettingsApplier:
         hypr_config_dir = os.path.dirname(outputs_path) if outputs_path else os.path.join(get_config_home(), "hypr")
         info = detect_hyprland_monitors_path(hypr_config_dir)
 
-        if outputs_path and not outputs_path.endswith("monitors.conf"):
+        if outputs_path:
             if outputs_path.endswith(".lua"):
-                outputs_path_lua = outputs_path
-                outputs_path_conf = outputs_path.removesuffix(".lua") + ".conf"
+                outputs_path_lua = os.path.expanduser(outputs_path)
+                outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+            elif outputs_path.endswith(".conf"):
+                default_conf = os.path.join(hypr_config_dir, "monitors.conf")
+                if info["config_type"] == "lua" and outputs_path == default_conf:
+                    outputs_path_lua = info["path"]
+                    outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+                else:
+                    outputs_path_conf = os.path.expanduser(outputs_path)
+                    outputs_path_lua = outputs_path_conf.removesuffix(".conf") + ".lua"
             else:
-                outputs_path_conf = outputs_path
-                outputs_path_lua = outputs_path.removesuffix(".conf") + ".lua"
+                outputs_path_lua = os.path.expanduser(outputs_path)
+                outputs_path_conf = outputs_path_lua + ".conf"
         else:
             if info["config_type"] == "lua":
                 outputs_path_lua = info["path"]
@@ -88,6 +97,7 @@ class SettingsApplier:
         ok, msg = verify_live_monitors(displays, hyprctl)
         if not ok:
             eprint(f"[Hyprland] Post-apply verification warning: {msg}")
+            notify("Hyprland Display Warning", msg)
 
         # 3. Generate Lua lines preserving existing options like sdr_max_luminance
         header = SettingsApplier._get_header("Profile Loader")
@@ -410,13 +420,21 @@ class SettingsApplier:
         hypr_config_dir = os.path.dirname(outputs_path) if outputs_path else os.path.join(get_config_home(), "hypr")
         info = detect_hyprland_monitors_path(hypr_config_dir)
 
-        if outputs_path and not outputs_path.endswith("monitors.conf"):
+        if outputs_path:
             if outputs_path.endswith(".lua"):
-                outputs_path_lua = outputs_path
-                outputs_path_conf = outputs_path.removesuffix(".lua") + ".conf"
+                outputs_path_lua = os.path.expanduser(outputs_path)
+                outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+            elif outputs_path.endswith(".conf"):
+                default_conf = os.path.join(hypr_config_dir, "monitors.conf")
+                if info["config_type"] == "lua" and outputs_path == default_conf:
+                    outputs_path_lua = info["path"]
+                    outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+                else:
+                    outputs_path_conf = os.path.expanduser(outputs_path)
+                    outputs_path_lua = outputs_path_conf.removesuffix(".conf") + ".lua"
             else:
-                outputs_path_conf = outputs_path
-                outputs_path_lua = outputs_path.removesuffix(".conf") + ".lua"
+                outputs_path_lua = os.path.expanduser(outputs_path)
+                outputs_path_conf = outputs_path_lua + ".conf"
         else:
             if info["config_type"] == "lua":
                 outputs_path_lua = info["path"]
@@ -467,6 +485,7 @@ class SettingsApplier:
         ok, msg = verify_live_monitors(displays, hyprctl)
         if not ok:
             eprint(f"[Hyprland] Post-apply verification warning: {msg}")
+            notify("Hyprland Display Warning", msg)
 
         # 3. Backup prior to writing
         backup_conf = load_text_file(outputs_path_conf).splitlines() if os.path.isfile(outputs_path_conf) else []

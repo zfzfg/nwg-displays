@@ -192,7 +192,7 @@ def list_outputs():
                     "color_mode": "",
                     "sdr_brightness": 1.0,
                     "sdr_saturation": 1.0,
-                    "sdr_max_luminance": 80.0,
+                    "sdr_max_luminance": None,
                     "monitor": None,
                     # Store raw make/model for matching
                     "__niri_make": raw_make,
@@ -255,7 +255,7 @@ def list_outputs():
                 outputs_dict[item.name]["color_mode"] = ""
                 outputs_dict[item.name]["sdr_brightness"] = 1.0
                 outputs_dict[item.name]["sdr_saturation"] = 1.0
-                outputs_dict[item.name]["sdr_max_luminance"] = 80.0
+                outputs_dict[item.name]["sdr_max_luminance"] = None
                 outputs_dict[item.name]["monitor"] = None
 
     elif os.getenv("HYPRLAND_INSTANCE_SIGNATURE"):
@@ -334,7 +334,8 @@ def list_outputs():
             outputs_dict[m["name"]]["color_mode"] = cm if cm in ["auto", "wide", "edid", "hdr", "hdredid"] else ""
             outputs_dict[m["name"]]["sdr_brightness"] = float(m.get("sdrBrightness", 1.0))
             outputs_dict[m["name"]]["sdr_saturation"] = float(m.get("sdrSaturation", 1.0))
-            outputs_dict[m["name"]]["sdr_max_luminance"] = float(m.get("sdrMaxLuminance", 80.0))
+            raw_sdr_max = float(m.get("sdrMaxLuminance", 80.0))
+            outputs_dict[m["name"]]["sdr_max_luminance"] = raw_sdr_max if raw_sdr_max > 80.0 else None
 
 
             # to identify Gdk.Monitor

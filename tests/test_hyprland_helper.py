@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch, MagicMock
 
 from nwg_displays.hyprland_helper import (
     atomic_write_file,
@@ -11,6 +12,7 @@ from nwg_displays.hyprland_helper import (
     merge_and_generate_lua,
     parse_existing_lua_monitors,
     parse_lua_monitors_string,
+    strip_lua_comment,
     verify_live_monitors,
 )
 
@@ -371,6 +373,162 @@ class TestHyprlandHelper(unittest.TestCase):
             content = f.read()
         self.assertIn("sdr_max_luminance = 400", content)
         self.assertIn("transform = 1", content)
+
+    def test_parse_inline_comments_and_hyprctl_commands(self):
+        lua_input = """-- Monitor with inline comments
+hl.monitor({
+    output = "DP-3",
+    mode = "2560x1440@300",
+    sdr_max_luminance = 400, -- Peak HDR nits
+    cm = "hdr", -- color mode
+})
+"""
+        parsed = parse_lua_monitors_string(lua_input)
+        self.assertIn("DP-3", parsed)
+        props = parsed["DP-3"]["props"]
+        self.assertEqual(props["sdr_max_luminance"], "400")
+        self.assertEqual(props["cm"], '"hdr"')
+        inline_c = parsed["DP-3"]["inline_comments"]
+        self.assertEqual(inline_c["sdr_max_luminance"], "-- Peak HDR nits")
+        self.assertEqual(inline_c["cm"], "-- color mode")
+
+        displays = [
+            {
+                "name": "DP-3",
+                "physical_width": 2560,
+                "physical_height": 1440,
+                "refresh": 300.0,
+                "x": 1050,
+                "y": 0,
+                "scale": 1.25,
+                "active": True,
+                "transform": "normal",
+                "adaptive_sync": False,
+            }
+        ]
+
+        # Verify hyprctl keyword command is clean without inline comments inside command string
+        cmds = generate_hyprctl_keyword_commands(displays, parsed)
+        self.assertEqual(len(cmds), 1)
+        self.assertNotIn("--", cmds[0])
+        self.assertIn("cm,hdr", cmds[0])
+
+        # Verify merge output generates valid Lua with comma before comment
+        lines = merge_and_generate_lua(displays, parsed, header="-- Generated")
+        out_lua = "\n".join(lines)
+        self.assertIn("sdr_max_luminance = 400, -- Peak HDR nits", out_lua)
+        self.assertIn('cm = "hdr", -- color mode', out_lua)
+
+    def test_detect_ignores_commented_requires_and_supports_no_parens(self):
+        config_content = """-- Custom CachyOS Hyprland Entry
+-- require("monitors")
+require "config.monitors"
+-- require("config.workspaces")
+require 'config.workspaces'
+"""
+        entry_file = os.path.join(self.hypr_dir, "hyprland.lua")
+        with open(entry_file, "w") as f:
+            f.write(config_content)
+
+        mon_info = detect_hyprland_monitors_path(self.hypr_dir)
+        self.assertEqual(mon_info["config_type"], "lua")
+        self.assertEqual(mon_info["module"], "config.monitors")
+        self.assertTrue(mon_info["include_found"])
+
+        ws_info = detect_hyprland_workspaces_path(self.hypr_dir)
+        self.assertEqual(ws_info["config_type"], "lua")
+        self.assertEqual(ws_info["module"], "config.workspaces")
+        self.assertTrue(ws_info["include_found"])
+
+    def test_sdr_display_does_not_get_sdr_max_luminance_80(self):
+        displays = [
+            {
+                "name": "HDMI-A-1",
+                "physical_width": 1680,
+                "physical_height": 1050,
+                "refresh": 59.95,
+                "x": 0,
+                "y": 0,
+                "scale": 1.0,
+                "active": True,
+                "transform": "normal",
+                "adaptive_sync": False,
+                "color_mode": "",
+                "sdr_max_luminance": None,
+            }
+        ]
+        # Even if existing config previously had sdr_max_luminance = 80 from buggy run
+        existing = {
+            "HDMI-A-1": {
+                "props": {"output": '"HDMI-A-1"', "sdr_max_luminance": "80"},
+                "inline_comments": {},
+            }
+        }
+        lines = merge_and_generate_lua(displays, existing, header="-- Test")
+        out_lua = "\n".join(lines)
+        self.assertNotIn("sdr_max_luminance", out_lua)
+
+    def test_preserve_unmanaged_unplugged_monitors_in_merge(self):
+        existing = {
+            "HDMI-A-1": {
+                "comment": "-- Left monitor",
+                "props": {"output": '"HDMI-A-1"', "mode": '"1680x1050@59.95"'},
+                "inline_comments": {},
+            },
+            "eDP-1": {
+                "comment": "-- Built-in laptop screen (currently unplugged/docked)",
+                "props": {"output": '"eDP-1"', "mode": '"1920x1080@60"', "scale": "1"},
+                "inline_comments": {},
+            },
+        }
+        # GUI only manages HDMI-A-1 right now
+        displays = [
+            {
+                "name": "HDMI-A-1",
+                "physical_width": 1680,
+                "physical_height": 1050,
+                "refresh": 59.95,
+                "x": 0,
+                "y": 0,
+                "scale": 1.0,
+                "active": True,
+                "transform": "normal",
+            }
+        ]
+        lines = merge_and_generate_lua(displays, existing, header="-- Test")
+        out_lua = "\n".join(lines)
+        self.assertIn('output = "HDMI-A-1"', out_lua)
+        # eDP-1 MUST be preserved!
+        self.assertIn('output = "eDP-1"', out_lua)
+        self.assertIn("Built-in laptop screen", out_lua)
+
+    def test_on_workspaces_apply_writes_modular_lua(self):
+        import nwg_displays.main as main_mod
+
+        config_dir = os.path.join(self.hypr_dir, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        ws_lua_file = os.path.join(config_dir, "workspaces.lua")
+
+        main_mod.workspaces_path = ws_lua_file
+        main_mod.config = {"use-desc": False}
+        main_mod.workspaces = {"1": "HDMI-A-1", "2": "DP-3"}
+
+        # Call on_workspaces_apply_btn_hypr
+        dummy_btn = None
+        dummy_win = None
+        # Mock close_dialog and notify
+        with patch.object(main_mod, "close_dialog"), patch.object(main_mod, "notify"):
+            main_mod.on_workspaces_apply_btn_hypr(dummy_btn, dummy_win, old_workspaces={})
+
+        self.assertTrue(os.path.isfile(ws_lua_file))
+        with open(ws_lua_file, "r") as f:
+            content = f.read()
+
+        # Must be valid Lua workspace_rule syntax, NOT .conf syntax
+        self.assertIn("hl.workspace_rule({", content)
+        self.assertIn('workspace = "1"', content)
+        self.assertIn('monitor = "HDMI-A-1"', content)
+        self.assertNotIn("workspace=1,monitor", content)
 
 
 if __name__ == "__main__":

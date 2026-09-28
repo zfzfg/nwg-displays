@@ -53,21 +53,23 @@ flowchart TD
 A dedicated helper module handling all Hyprland modular Lua interactions:
 
 * **Dynamic Config Path Detection (`detect_hyprland_monitors_path`, `detect_hyprland_workspaces_path`)**:
-  - Scans `hyprland.lua` line-by-line using lexical patterns.
-  - Correctly detects CachyOS modular paths (`require("config.monitors")` -> `~/.config/hypr/config/monitors.lua`) and upstream conventions (`require("monitors")` -> `~/.config/hypr/monitors.lua`).
+  - Scans `hyprland.lua` line-by-line using quote-aware lexical patterns.
+  - Correctly ignores commented-out requires (`-- require(...)`), supports calls without parentheses (`require "module"`), and resolves CachyOS modular paths (`require("config.monitors")` -> `~/.config/hypr/config/monitors.lua`).
   - Emits descriptive warnings if the detected file is not actively imported in `hyprland.lua`.
-* **Lexical Parser (`parse_existing_lua_monitors`)**:
+* **Lexical Parser (`parse_existing_lua_monitors`, `strip_lua_comment`)**:
   - Extracts each `hl.monitor({ ... })` declaration and tokenizes its key-value pairs without executing arbitrary Lua code.
-  - Captures comments and unmanaged custom properties.
+  - Cleanly separates values from inline comments (`-- comment`), preventing invalid Lua syntax or corrupted hyprctl commands.
 * **Non-Destructive Generator (`merge_and_generate_lua`)**:
   - Updates GUI-controlled properties: `name`, `resolution`, `offset`, `scale`, `transform`, `vrr`, `mirror`, `bitdepth`, `cm`, `sdr_brightness`, `sdr_saturation`.
   - Preserves extended monitor properties such as `sdr_max_luminance = 400`, block/inline comments, and custom compositor options.
-  - Automatically appends newly detected monitors or disabled monitors (`hl.monitor({ "NAME", "disable" })`).
+  - Preserves unplugged/unmanaged monitor configurations present in `monitors.lua`.
+  - Avoids polluting standard SDR monitors with default `sdr_max_luminance = 80`.
 * **Live Compositor Apply (`generate_hyprctl_keyword_commands`)**:
   - Generates real-time commands (e.g. `hyprctl keyword monitor DP-3,2560x1440@300.0,1200x384,1.25,vrr,0,cm,hdr,sdr_brightness,1.0,sdr_saturation,1.0,bitdepth,10`).
   - Applies configurations immediately without requiring compositor restart.
 * **Verification Engine (`verify_live_monitors`)**:
   - Queries `hyprctl j/monitors` following keyword commands to confirm that resolution, logical offset, and active status match the target state.
+  - Emits visible desktop notifications (`notify`) if verification encounters discrepancies.
 * **Atomic File Writer (`atomic_write_file`)**:
   - Writes to a temporary file on the same filesystem (`.tmp.<pid>`).
   - Creates a `.bak` copy of the original file.
@@ -79,6 +81,7 @@ A dedicated helper module handling all Hyprland modular Lua interactions:
 * **Modular Lua Integration**:
   - Refactored `_apply_hyprland_gui` and `_apply_hyprland_json` to utilize `hyprland_helper.py`.
   - Replaces legacy destructive string templates with the merge engine.
+  - Dispatches desktop warning notifications on post-apply verification mismatch.
 * **Rollback Safety**:
   - Supplies full 4-tuple backups `(backup_conf, backup_lua, conf_path, lua_path)` to the GUI confirmation dialog.
   - On timeout or cancellation, restores the exact modular Lua file and reloads Hyprland.
@@ -88,8 +91,7 @@ A dedicated helper module handling all Hyprland modular Lua interactions:
 ### C. Display Data Extractor: `nwg_displays/tools.py`
 * **Extended Property Extraction (`list_outputs`)**:
   - Parses `sdrMaxLuminance` from `hyprctl monitors -j` output.
-  - Forwards `sdr_max_luminance` into output dictionaries and `DisplayButton` instances.
-  - Provides fallback defaults for Sway and Niri.
+  - Only stores `sdr_max_luminance` for genuine HDR modes (> 80 nits), preventing standard SDR displays from being polluted with redundant 80 nit directives.
 
 ---
 
@@ -115,12 +117,14 @@ The visual monitor canvas was overhauled to resolve dragging and responsive issu
    - Added `Gdk.EventMask.BUTTON_RELEASE_MASK` and connected `on_button_release_event` to cleanly finalize placement, snap coordinates, and synchronize UI state.
 5. **Nearest-Line Edge Snapping**:
    - Evaluates all candidate edges (left, right, top, bottom) against neighboring displays and snaps to the true minimum distance within threshold.
+6. **Modular Workspaces Rule Generation (`on_workspaces_apply_btn_hypr`)**:
+   - Safely writes `hl.workspace_rule({ ... })` to modular `.lua` workspace files using `atomic_write_file`, preventing file format confusion or crashes.
 
 ---
 
 ## 4. Test Suite & Verification
 
-The test suite contains **17 automated unit tests** across three test modules:
+The test suite contains **22 automated unit tests** across three test modules:
 
 ```text
 $ python -m unittest discover -s tests -p "test_*.py" -v
@@ -133,17 +137,22 @@ test_spinbutton_feedback_loop_isolated (test_canvas_dragging.TestCanvasDragging.
 test_apply_from_gui_hyprland_flow (test_hyprland_helper.TestHyprlandHelper.test_apply_from_gui_hyprland_flow) ... ok
 test_atomic_write_file (test_hyprland_helper.TestHyprlandHelper.test_atomic_write_file) ... ok
 test_detect_cachyos_modular_lua (test_hyprland_helper.TestHyprlandHelper.test_detect_cachyos_modular_lua) ... ok
+test_detect_ignores_commented_requires_and_supports_no_parens (test_hyprland_helper.TestHyprlandHelper.test_detect_ignores_commented_requires_and_supports_no_parens) ... ok
 test_detect_legacy_conf (test_hyprland_helper.TestHyprlandHelper.test_detect_legacy_conf) ... ok
 test_detect_upstream_lua (test_hyprland_helper.TestHyprlandHelper.test_detect_upstream_lua) ... ok
 test_disabled_and_mirrored_monitor_generation (test_hyprland_helper.TestHyprlandHelper.test_disabled_and_mirrored_monitor_generation) ... ok
 test_generate_hyprctl_keyword_commands (test_hyprland_helper.TestHyprlandHelper.test_generate_hyprctl_keyword_commands) ... ok
 test_merge_and_generate_lua_preserves_hdr_properties (test_hyprland_helper.TestHyprlandHelper.test_merge_and_generate_lua_preserves_hdr_properties) ... ok
+test_on_workspaces_apply_writes_modular_lua (test_hyprland_helper.TestHyprlandHelper.test_on_workspaces_apply_writes_modular_lua) ... ok
 test_parse_existing_lua_monitors (test_hyprland_helper.TestHyprlandHelper.test_parse_existing_lua_monitors) ... ok
+test_parse_inline_comments_and_hyprctl_commands (test_hyprland_helper.TestHyprlandHelper.test_parse_inline_comments_and_hyprctl_commands) ... ok
+test_preserve_unmanaged_unplugged_monitors_in_merge (test_hyprland_helper.TestHyprlandHelper.test_preserve_unmanaged_unplugged_monitors_in_merge) ... ok
+test_sdr_display_does_not_get_sdr_max_luminance_80 (test_hyprland_helper.TestHyprlandHelper.test_sdr_display_does_not_get_sdr_max_luminance_80) ... ok
 test_unincluded_config_detection (test_hyprland_helper.TestHyprlandHelper.test_unincluded_config_detection) ... ok
 test_verify_live_monitors (test_hyprland_helper.TestHyprlandHelper.test_verify_live_monitors) ... ok
 
 ----------------------------------------------------------------------
-Ran 17 tests in 0.010s
+Ran 22 tests in 0.010s
 
 OK
 ```

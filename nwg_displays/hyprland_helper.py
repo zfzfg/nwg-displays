@@ -19,10 +19,29 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+def strip_lua_comment(line: str) -> Tuple[str, str]:
+    """
+    Strips inline Lua comment (-- comment) from line, respecting quotes.
+    Returns (code_part, comment_part).
+    """
+    in_single = False
+    in_double = False
+    for i in range(len(line)):
+        ch = line[i]
+        if ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '-' and not in_single and not in_double:
+            if i + 1 < len(line) and line[i + 1] == '-':
+                return line[:i].strip(), line[i:].strip()
+    return line.strip(), ""
+
+
 def detect_hyprland_monitors_path(hypr_config_dir: str) -> Dict[str, Any]:
     """
     Analyzes hyprland configuration entry points to determine the active monitors config path.
-    Checks hyprland.lua first (>= 0.55 / 0.56), scanning for require(...) calls.
+    Checks hyprland.lua first (>= 0.55 / 0.56), scanning for require(...) calls line-by-line.
     Falls back to hyprland.conf with source = ... directives.
     """
     hypr_config_dir = os.path.expanduser(hypr_config_dir)
@@ -33,11 +52,16 @@ def detect_hyprland_monitors_path(hypr_config_dir: str) -> Dict[str, Any]:
     if os.path.isfile(lua_entry):
         try:
             with open(lua_entry, "r", encoding="utf-8") as f:
-                content = f.read()
+                lines = f.readlines()
 
-            # Find all require("...") or require('...')
-            requires = re.findall(r"""require\s*\(\s*["']([^"']+)["']\s*\)""", content)
-            monitor_requires = [r for r in requires if "monitor" in r.lower()]
+            monitor_requires = []
+            for line in lines:
+                code_part, _ = strip_lua_comment(line)
+                if not code_part:
+                    continue
+                m = re.search(r"""^\s*require\s*\(?\s*["']([^"']+)["']\s*\)?""", code_part)
+                if m and "monitor" in m.group(1).lower():
+                    monitor_requires.append(m.group(1))
 
             if len(monitor_requires) == 1:
                 mod_name = monitor_requires[0]
@@ -84,10 +108,16 @@ def detect_hyprland_monitors_path(hypr_config_dir: str) -> Dict[str, Any]:
     if os.path.isfile(conf_entry):
         try:
             with open(conf_entry, "r", encoding="utf-8") as f:
-                content = f.read()
+                lines = f.readlines()
 
-            sources = re.findall(r"""^\s*source\s*=\s*(.+)$""", content, re.MULTILINE)
-            monitor_sources = [s.strip() for s in sources if "monitor" in s.lower()]
+            monitor_sources = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                m = re.search(r"""^\s*source\s*=\s*(.+)$""", stripped)
+                if m and "monitor" in m.group(1).lower():
+                    monitor_sources.append(m.group(1).strip())
 
             if monitor_sources:
                 chosen = monitor_sources[0]
@@ -135,10 +165,16 @@ def detect_hyprland_workspaces_path(hypr_config_dir: str) -> Dict[str, Any]:
     if os.path.isfile(lua_entry):
         try:
             with open(lua_entry, "r", encoding="utf-8") as f:
-                content = f.read()
+                lines = f.readlines()
 
-            requires = re.findall(r"""require\s*\(\s*["']([^"']+)["']\s*\)""", content)
-            ws_requires = [r for r in requires if "workspace" in r.lower()]
+            ws_requires = []
+            for line in lines:
+                code_part, _ = strip_lua_comment(line)
+                if not code_part:
+                    continue
+                m = re.search(r"""^\s*require\s*\(?\s*["']([^"']+)["']\s*\)?""", code_part)
+                if m and "workspace" in m.group(1).lower():
+                    ws_requires.append(m.group(1))
 
             if ws_requires:
                 chosen = ws_requires[0]
@@ -195,6 +231,14 @@ def parse_existing_lua_monitors(file_path: str) -> Dict[str, Dict[str, Any]]:
 def parse_lua_monitors_string(content: str) -> Dict[str, Dict[str, Any]]:
     """
     Parses hl.monitor({ ... }) blocks from a string.
+    Returns:
+    {
+        "output_name": {
+            "comment": "-- comment before block",
+            "props": {"key": "raw_value_string", ...},
+            "inline_comments": {"key": "-- inline comment", ...}
+        }
+    }
     """
     monitors: Dict[str, Dict[str, Any]] = {}
 
@@ -209,30 +253,37 @@ def parse_lua_monitors_string(content: str) -> Dict[str, Dict[str, Any]]:
         body = match.group(2)
 
         props: Dict[str, str] = {}
-        # Parse each line in body: key = value [,] [-- optional comment]
+        inline_comments: Dict[str, str] = {}
+
         for line in body.splitlines():
             line = line.strip()
             if not line or line.startswith("--"):
                 continue
 
+            code_part, comment_part = strip_lua_comment(line)
+            if not code_part:
+                continue
+
             # Strip trailing comma
-            if line.endswith(","):
-                line = line[:-1].strip()
+            if code_part.endswith(","):
+                code_part = code_part[:-1].strip()
 
             # Separate key and value
-            if "=" in line:
-                key, val = line.split("=", 1)
+            if "=" in code_part:
+                key, val = code_part.split("=", 1)
                 key = key.strip()
                 val = val.strip()
                 props[key] = val
+                if comment_part:
+                    inline_comments[key] = comment_part
 
         output_raw = props.get("output")
         if output_raw:
-            # Strip quotes
             clean_output = output_raw.strip('"\'')
             monitors[clean_output] = {
                 "comment": comment_block,
                 "props": props,
+                "inline_comments": inline_comments,
             }
 
     return monitors
@@ -261,11 +312,16 @@ def merge_and_generate_lua(
     }
 
     lines = [header.strip().replace("#", "--"), ""]
+    handled_names = set()
 
     for d in displays:
         name = d["name"] if not use_desc else f"desc:{d['description']}"
+        handled_names.add(name)
+        handled_names.add(d["name"])
+
         existing = existing_by_output.get(name) or existing_by_output.get(d["name"]) or {}
         existing_props = dict(existing.get("props", {}))
+        inline_c = existing.get("inline_comments", {})
         comment = existing.get("comment", "")
 
         if comment:
@@ -294,7 +350,6 @@ def merge_and_generate_lua(
                 t_code = transforms.get(transform_val, 0)
                 props_to_write.append(("transform", str(t_code)))
             elif "transform" in existing_props and existing_props["transform"] == "0":
-                # preserve explicit transform = 0 if it was there
                 props_to_write.append(("transform", "0"))
 
             # VRR
@@ -313,10 +368,15 @@ def merge_and_generate_lua(
 
             # sdr_max_luminance preservation (crucial for HDR displays like MSI MAG 274)
             sdr_max_lum = d.get("sdr_max_luminance")
-            if sdr_max_lum is not None:
+            if "sdr_max_luminance" in existing_props:
+                existing_lum = existing_props["sdr_max_luminance"].strip()
+                # If existing config has an explicit setting (> 80 nits or display is in HDR mode)
+                if existing_lum != "80" or hdr:
+                    props_to_write.append(("sdr_max_luminance", existing_lum))
+                elif sdr_max_lum and sdr_max_lum > 80:
+                    props_to_write.append(("sdr_max_luminance", str(int(sdr_max_lum) if float(sdr_max_lum).is_integer() else sdr_max_lum)))
+            elif sdr_max_lum and sdr_max_lum > 80:
                 props_to_write.append(("sdr_max_luminance", str(int(sdr_max_lum) if float(sdr_max_lum).is_integer() else sdr_max_lum)))
-            elif "sdr_max_luminance" in existing_props:
-                props_to_write.append(("sdr_max_luminance", existing_props["sdr_max_luminance"]))
 
             if color_mode:
                 props_to_write.append(("cm", f'"{color_mode}"'))
@@ -343,10 +403,26 @@ def merge_and_generate_lua(
         # Format hl.monitor block
         block_lines = ["hl.monitor({"]
         for k, v in props_to_write:
-            block_lines.append(f"    {k} = {v},")
+            comment_suffix = f" {inline_c[k]}" if k in inline_c else ""
+            block_lines.append(f"    {k} = {v},{comment_suffix}")
         block_lines.append("})\n")
 
         lines.extend(block_lines)
+
+    # Preserve any existing monitor declarations from file that were not in GUI displays list
+    for name, mon_info in existing_by_output.items():
+        if name not in handled_names:
+            comment = mon_info.get("comment", "")
+            if comment:
+                lines.append(comment)
+            raw_props = mon_info.get("props", {})
+            inline_c = mon_info.get("inline_comments", {})
+            block_lines = ["hl.monitor({"]
+            for k, v in raw_props.items():
+                comment_suffix = f" {inline_c[k]}" if k in inline_c else ""
+                block_lines.append(f"    {k} = {v},{comment_suffix}")
+            block_lines.append("})\n")
+            lines.extend(block_lines)
 
     return lines
 
