@@ -21,6 +21,10 @@ import threading
 import gi
 from nwg_displays.settings_applier import SettingsApplier
 from nwg_displays.wallpaper_manager import WallpaperManager
+from nwg_displays.hyprland_helper import (
+    detect_hyprland_monitors_path,
+    detect_hyprland_workspaces_path,
+)
 
 
 gi.require_version("Gtk", "3.0")
@@ -82,8 +86,10 @@ if sway:
     for name in ["outputs", "workspaces"]:
         create_empty_file(os.path.join(sway_config_dir, name))
 elif hypr:
-    for name in ["monitors.conf", "workspaces.conf"]:
-        create_empty_file(os.path.join(hypr_config_dir, name))
+    lua_entry = os.path.join(hypr_config_dir, "hyprland.lua")
+    if not os.path.isfile(lua_entry):
+        for name in ["monitors.conf", "workspaces.conf"]:
+            create_empty_file(os.path.join(hypr_config_dir, name))
 elif niri:
     for name in ["monitor.kdl"]:
         create_empty_file(os.path.join(niri_config_dir, name))
@@ -427,6 +433,7 @@ class DisplayButton(Gtk.Button):
         color_mode="",
         sdr_brightness=1.0,
         sdr_saturation=1.0,
+        sdr_max_luminance=None,
     ):
         super().__init__()
         # Output properties
@@ -458,6 +465,7 @@ class DisplayButton(Gtk.Button):
         self.color_mode = color_mode
         self.sdr_brightness = sdr_brightness
         self.sdr_saturation = sdr_saturation
+        self.sdr_max_luminance = sdr_max_luminance
 
         # Button properties
         self.selected = False
@@ -755,6 +763,7 @@ def create_display_buttons():
             color_mode=item.get("color_mode", ""),
             sdr_brightness=item.get("sdr_brightness", 1.0),
             sdr_saturation=item.get("sdr_saturation", 1.0),
+            sdr_max_luminance=item.get("sdr_max_luminance"),
         )
 
         display_buttons.append(b)
@@ -1098,18 +1107,24 @@ def restore_old_settings(btn, backup, path):
         create_display_buttons()
 
     elif os.getenv("HYPRLAND_INSTANCE_SIGNATURE"):
-        # For Hyprland: backup is a tuple (lines_conf, lines_lua), restore both
+        # For Hyprland: backup can be (lines_conf, lines_lua, conf_path, lua_path) or (lines_conf, lines_lua)
         if isinstance(backup, tuple):
-            lua_path = path.removesuffix(".conf") + ".lua" if path.endswith(".conf") else "~/.config/hypr/monitors.lua"
-            save_list_to_text_file(backup[0], path)
-            if backup[1]:
-                save_list_to_text_file(backup[1], lua_path)
+            if len(backup) >= 4:
+                b_conf, b_lua, conf_p, lua_p = backup[0], backup[1], backup[2], backup[3]
+                if b_conf and conf_p:
+                    save_list_to_text_file(b_conf, conf_p)
+                if b_lua and lua_p:
+                    save_list_to_text_file(b_lua, lua_p)
+            else:
+                lua_path = path.removesuffix(".conf") + ".lua" if path.endswith(".conf") else "~/.config/hypr/monitors.lua"
+                save_list_to_text_file(backup[0], path)
+                if backup[1]:
+                    save_list_to_text_file(backup[1], lua_path)
         else:
             save_list_to_text_file(backup, path)
+        hyprctl("reload")
         confirm_win.close()
-        # Don't execute any command here, just save the file and wait for Hyprland to notice and apply the change.
-        # Let's give it some time to do it before refreshing UI.
-        GLib.timeout_add(2000, create_display_buttons)
+        GLib.timeout_add(1000, create_display_buttons)
 
     elif os.getenv("NIRI_SOCKET"):
         # For niri: backup is a file path (.bak), restore by copying it back
@@ -1146,24 +1161,25 @@ def main():
         )
 
     elif hypr:
+        hypr_mon_info = detect_hyprland_monitors_path(hypr_config_dir)
+        hypr_ws_info = detect_hyprland_workspaces_path(hypr_config_dir)
+        default_mon_path = hypr_mon_info["path"]
+        default_ws_path = hypr_ws_info["path"]
+
         parser.add_argument(
             "-m",
             "--monitors_path",
             type=str,
-            default="{}/monitors.conf".format(hypr_config_dir),
-            help="path to save the monitors.conf file to, default: {}".format(
-                "{}/monitors.conf".format(hypr_config_dir)
-            ),
+            default=default_mon_path,
+            help=f"path to save the monitors configuration file to, default: {default_mon_path}",
         )
 
         parser.add_argument(
             "-w",
             "--workspaces_path",
             type=str,
-            default="{}/workspaces.conf".format(hypr_config_dir),
-            help="path to save the workspaces.conf file to, default: {}".format(
-                "{}/workspaces.conf".format(hypr_config_dir)
-            ),
+            default=default_ws_path,
+            help=f"path to save the workspaces configuration file to, default: {default_ws_path}",
         )
 
         parser.add_argument(
@@ -1215,6 +1231,9 @@ def main():
     elif hypr:
         if os.path.isdir(hypr_config_dir):
             outputs_path = args.monitors_path
+            if not hypr_mon_info.get("include_found", True):
+                eprint(f"[Warning] Your Hyprland configuration does not seem to include '{outputs_path}'.")
+                eprint('For Hyprland >= 0.55 using Lua, make sure hyprland.lua contains: require("config.monitors") or require("monitors")')
             # 97, 115
             if os.path.lexists(outputs_path):
                 is_writable = os.access(outputs_path, os.W_OK)

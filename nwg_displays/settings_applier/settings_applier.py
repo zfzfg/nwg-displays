@@ -4,6 +4,7 @@ import datetime
 import json
 import time
 from nwg_displays.tools import (
+    eprint,
     hyprctl,
     niri_msg,
     niri_reload_config,
@@ -15,8 +16,15 @@ from nwg_displays.tools import (
     load_json,
     save_json,
 )
-from nwg_displays.wallpaper_manager import WallpaperManager
-from nwg_displays.tools import get_config
+from nwg_displays.tools import get_config, get_config_home
+from nwg_displays.hyprland_helper import (
+    detect_hyprland_monitors_path,
+    parse_existing_lua_monitors,
+    merge_and_generate_lua,
+    generate_hyprctl_keyword_commands,
+    atomic_write_file,
+    verify_live_monitors,
+)
 
 class SettingsApplier:
     @staticmethod
@@ -45,118 +53,77 @@ class SettingsApplier:
 
     @staticmethod
     def _apply_hyprland_json(displays, use_desc, outputs_path, profile_data):
-        transforms = {
-            "normal": 0,
-            "90": 1,
-            "180": 2,
-            "270": 3,
-            "flipped": 4,
-            "flipped-90": 5,
-            "flipped-180": 6,
-            "flipped-270": 7,
-        }
+        hypr_config_dir = os.path.dirname(outputs_path) if outputs_path else os.path.join(get_config_home(), "hypr")
+        info = detect_hyprland_monitors_path(hypr_config_dir)
 
-        print(f"[Profile] Applying {len(displays)} displays for Hyprland...")
+        if outputs_path and not outputs_path.endswith("monitors.conf"):
+            if outputs_path.endswith(".lua"):
+                outputs_path_lua = outputs_path
+                outputs_path_conf = outputs_path.removesuffix(".lua") + ".conf"
+            else:
+                outputs_path_conf = outputs_path
+                outputs_path_lua = outputs_path.removesuffix(".conf") + ".lua"
+        else:
+            if info["config_type"] == "lua":
+                outputs_path_lua = info["path"]
+                outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+            else:
+                outputs_path_conf = info["path"]
+                outputs_path_lua = outputs_path_conf.removesuffix(".conf") + ".lua"
 
-        header = SettingsApplier._get_header("Profile Loader")
-        lines_conf = []
-        lines_lua = [header.replace("#", "--")]
+        print(f"[Profile] Applying {len(displays)} displays for Hyprland to {outputs_path_lua}...")
+
+        existing_by_output = parse_existing_lua_monitors(outputs_path_lua)
+
+        # 1. Live apply via keyword monitor
+        cmds = generate_hyprctl_keyword_commands(displays, existing_by_output, use_desc=use_desc)
+        for cmd in cmds:
+            hyprctl(cmd)
 
         for d in displays:
-            if not use_desc:
-                name = d["name"]
-            else:
-                name = f"desc:{d['description']}"
+            cmd = "on" if d.get("dpms", True) else "off"
+            hyprctl(f"dispatch dpms {cmd} {d['name']}")
 
-            lua_props = [f'    output = "{name}"']
+        # 2. Verify live compositor response
+        ok, msg = verify_live_monitors(displays, hyprctl)
+        if not ok:
+            eprint(f"[Hyprland] Post-apply verification warning: {msg}")
 
-            if not d["active"]:
+        # 3. Generate Lua lines preserving existing options like sdr_max_luminance
+        header = SettingsApplier._get_header("Profile Loader")
+        lines_lua = merge_and_generate_lua(displays, existing_by_output, header=header, use_desc=use_desc)
+
+        # 4. Generate legacy conf lines
+        lines_conf = [header]
+        transforms = {"normal": 0, "90": 1, "180": 2, "270": 3, "flipped": 4, "flipped-90": 5, "flipped-180": 6, "flipped-270": 7}
+        for d in displays:
+            name = d["name"] if not use_desc else f"desc:{d['description']}"
+            if not d.get("active", True):
                 lines_conf.append(f"monitor={name},disable")
-                lua_props.append("    disabled = true")
-                hyprctl(f"dispatch dpms off {d['name']}")
             else:
-                conf_line = "monitor={},{}x{}@{},{}x{},{}".format(
-                    name,
-                    d["physical_width"],
-                    d["physical_height"],
-                    d["refresh"],
-                    d["x"],
-                    d["y"],
-                    d["scale"],
-                )
-
-                mode = f"{d['physical_width']}x{d['physical_height']}@{d['refresh']}"
-                pos = f"{d['x']}x{d['y']}"
-                lua_props.extend([
-                    f'    mode = "{mode}"',
-                    f'    position = "{pos}"',
-                    f'    scale = {d["scale"]}',
-                ])
-
+                conf_line = f"monitor={name},{d['physical_width']}x{d['physical_height']}@{d['refresh']},{d['x']}x{d['y']},{d['scale']}"
                 if d.get("mirror"):
                     conf_line += f",mirror,{d['mirror']}"
-                    lua_props.append(f'    mirror = "{d["mirror"]}"')
-
-                color_mode = d.get("color_mode") or ""
-                hdr = color_mode in ("hdr", "hdredid")
-
-                # HDR requires 10-bit; force it even if not explicitly stored
-                if d.get("ten_bit") or hdr:
+                if d.get("ten_bit") or (d.get("color_mode") in ("hdr", "hdredid")):
                     conf_line += ",bitdepth,10"
-                    lua_props.append("    bitdepth = 10")
-
-                if color_mode:
-                    conf_line += f",cm,{color_mode}"
-                    lua_props.append(f'    cm = "{color_mode}"')
-                    if hdr:
-                        sdr_brightness = d.get("sdr_brightness", 1.0)
-                        sdr_saturation = d.get("sdr_saturation", 1.0)
-                        if sdr_brightness != 1.0:
-                            conf_line += f",sdrbrightness,{sdr_brightness}"
-                            lua_props.append(f"    sdrbrightness = {sdr_brightness}")
-                        if sdr_saturation != 1.0:
-                            conf_line += f",sdrsaturation,{sdr_saturation}"
-                            lua_props.append(f"    sdrsaturation = {sdr_saturation}")
-
-                # Adaptive sync (VRR). The toggle mirrors the monitor's effective
-                # state, so writing it explicitly is safe and keeps the toggle working.
-                # note: hyprland can also accept 2 or 3 to enable fullscreen-only VRR;
-                # may need to add that in the future
+                if d.get("color_mode"):
+                    conf_line += f",cm,{d['color_mode']}"
                 vrr = "1" if d.get("adaptive_sync") else "0"
                 conf_line += f",vrr,{vrr}"
-                lua_props.append(f"    vrr = {vrr}")
-
                 lines_conf.append(conf_line)
-
-                if d["transform"] != "normal":
+                if d.get("transform", "normal") != "normal":
                     t_code = transforms.get(d["transform"], 0)
                     lines_conf.append(f"monitor={name},transform,{t_code}")
-                    lua_props.append(f"    transform = {t_code}")
 
-                cmd = "on" if d["dpms"] else "off"
-                hyprctl(f"dispatch dpms {cmd} {d['name']}")
-
-            lua_table = ",\n".join(lua_props)
-            lines_lua.append(f"hl.monitor({{\n{lua_table}\n}})")
-
-        outputs_path_lua = (
-            outputs_path.removesuffix(".conf") + ".lua"
-            if outputs_path.endswith(".conf")
-            else "~/.config/hypr/monitors.lua"
-        )
-
-        lines_conf = [header] + [ln.replace("#", "##") for ln in lines_conf]
-
-        save_list_to_text_file(lines_conf, outputs_path)
-        save_list_to_text_file(lines_lua, outputs_path_lua)
+        # 5. Atomic writes
+        atomic_write_file(lines_lua, outputs_path_lua)
+        if info["config_type"] == "conf" or (outputs_path and outputs_path.endswith(".conf")):
+            atomic_write_file(lines_conf, outputs_path_conf)
 
         hyprctl("reload")
 
         config, config_file = get_config()
-
-        if "wallpapers" in profile_data and config.get(
-            "profile-bound-wallpapers", True
-        ):
+        if "wallpapers" in profile_data and config.get("profile-bound-wallpapers", True):
             print("[Profile] Applying wallpapers...")
             time.sleep(1)
             WallpaperManager.apply_wallpapers(profile_data["wallpapers"])
@@ -440,110 +407,108 @@ class SettingsApplier:
         config_dir=None,
         profile_name=None,
     ):
-        transforms = {
-            "normal": 0,
-            "90": 1,
-            "180": 2,
-            "270": 3,
-            "flipped": 4,
-            "flipped-90": 5,
-            "flipped-180": 6,
-            "flipped-270": 7,
-        }
+        hypr_config_dir = os.path.dirname(outputs_path) if outputs_path else os.path.join(get_config_home(), "hypr")
+        info = detect_hyprland_monitors_path(hypr_config_dir)
 
-        header = SettingsApplier._get_header()
-        lines_conf = []
-        lines_lua = [header.replace("#", "--")]
-
-        for db in display_buttons:
-            name = db.name if not use_desc else "desc:{}".format(db.description)
-
-            lua_props = [f'    output = "{name}"']
-
-            if db.name in outputs_activity and not outputs_activity[db.name]:
-                lines_conf.append(f"monitor={name},disable")
-                lua_props.append("    disabled = true")
-                hyprctl(f"dispatch dpms off {db.name}")
+        if outputs_path and not outputs_path.endswith("monitors.conf"):
+            if outputs_path.endswith(".lua"):
+                outputs_path_lua = outputs_path
+                outputs_path_conf = outputs_path.removesuffix(".lua") + ".conf"
             else:
-                conf_line = f"monitor={name},{db.physical_width}x{db.physical_height}@{db.refresh},{db.x}x{db.y},{db.scale}"
+                outputs_path_conf = outputs_path
+                outputs_path_lua = outputs_path.removesuffix(".conf") + ".lua"
+        else:
+            if info["config_type"] == "lua":
+                outputs_path_lua = info["path"]
+                outputs_path_conf = outputs_path_lua.removesuffix(".lua") + ".conf"
+            else:
+                outputs_path_conf = info["path"]
+                outputs_path_lua = outputs_path_conf.removesuffix(".conf") + ".lua"
 
-                mode = f"{db.physical_width}x{db.physical_height}@{db.refresh}"
-                pos = f"{db.x}x{db.y}"
-                lua_props.extend([
-                    f'    mode = "{mode}"',
-                    f'    position = "{pos}"',
-                    f"    scale = {db.scale}",
-                ])
+        print(f"[GUI] Applying {len(display_buttons)} displays for Hyprland to {outputs_path_lua}...")
 
-                if db.mirror:
-                    conf_line += f",mirror,{db.mirror}"
-                    lua_props.append(f'    mirror = "{db.mirror}"')
+        displays = []
+        for db in display_buttons:
+            active = outputs_activity.get(db.name, db.active) if db.name in outputs_activity else db.active
+            d = {
+                "name": db.name,
+                "description": db.description,
+                "active": active,
+                "physical_width": db.physical_width,
+                "physical_height": db.physical_height,
+                "refresh": db.refresh,
+                "x": db.x,
+                "y": db.y,
+                "scale": db.scale,
+                "transform": db.transform,
+                "dpms": db.dpms,
+                "adaptive_sync": db.adaptive_sync,
+                "mirror": db.mirror,
+                "ten_bit": db.ten_bit,
+                "color_mode": getattr(db, "color_mode", "") or "",
+                "sdr_brightness": getattr(db, "sdr_brightness", 1.0),
+                "sdr_saturation": getattr(db, "sdr_saturation", 1.0),
+                "sdr_max_luminance": getattr(db, "sdr_max_luminance", None),
+            }
+            displays.append(d)
 
-                color_mode = getattr(db, "color_mode", "") or ""
-                hdr = color_mode in ("hdr", "hdredid")
+        existing_by_output = parse_existing_lua_monitors(outputs_path_lua)
 
-                # HDR requires 10-bit; force it even if the checkbox is off
-                if db.ten_bit or hdr:
+        # 1. Live apply via keyword monitor
+        cmds = generate_hyprctl_keyword_commands(displays, existing_by_output, use_desc=use_desc)
+        for cmd in cmds:
+            hyprctl(cmd)
+
+        for d in displays:
+            cmd = "on" if d.get("dpms", True) else "off"
+            hyprctl(f"dispatch dpms {cmd} {d['name']}")
+
+        # 2. Verify live compositor response
+        ok, msg = verify_live_monitors(displays, hyprctl)
+        if not ok:
+            eprint(f"[Hyprland] Post-apply verification warning: {msg}")
+
+        # 3. Backup prior to writing
+        backup_conf = load_text_file(outputs_path_conf).splitlines() if os.path.isfile(outputs_path_conf) else []
+        backup_lua = load_text_file(outputs_path_lua).splitlines() if os.path.isfile(outputs_path_lua) else []
+
+        # 4. Generate Lua lines preserving existing options like sdr_max_luminance
+        header = SettingsApplier._get_header()
+        lines_lua = merge_and_generate_lua(displays, existing_by_output, header=header, use_desc=use_desc)
+
+        # 5. Generate legacy conf lines
+        lines_conf = [header]
+        transforms = {"normal": 0, "90": 1, "180": 2, "270": 3, "flipped": 4, "flipped-90": 5, "flipped-180": 6, "flipped-270": 7}
+        for d in displays:
+            name = d["name"] if not use_desc else f"desc:{d['description']}"
+            if not d.get("active", True):
+                lines_conf.append(f"monitor={name},disable")
+            else:
+                conf_line = f"monitor={name},{d['physical_width']}x{d['physical_height']}@{d['refresh']},{d['x']}x{d['y']},{d['scale']}"
+                if d.get("mirror"):
+                    conf_line += f",mirror,{d['mirror']}"
+                if d.get("ten_bit") or (d.get("color_mode") in ("hdr", "hdredid")):
                     conf_line += ",bitdepth,10"
-                    lua_props.append("    bitdepth = 10")
-
-                if color_mode:
-                    conf_line += f",cm,{color_mode}"
-                    lua_props.append(f'    cm = "{color_mode}"')
-                    if hdr:
-                        sdr_brightness = getattr(db, "sdr_brightness", 1.0)
-                        sdr_saturation = getattr(db, "sdr_saturation", 1.0)
-                        if sdr_brightness != 1.0:
-                            conf_line += f",sdrbrightness,{sdr_brightness}"
-                            lua_props.append(f"    sdrbrightness = {sdr_brightness}")
-                        if sdr_saturation != 1.0:
-                            conf_line += f",sdrsaturation,{sdr_saturation}"
-                            lua_props.append(f"    sdrsaturation = {sdr_saturation}")
-
-                # Adaptive sync (VRR). The toggle mirrors the monitor's effective
-                # state, so writing it explicitly is safe and keeps the toggle working.
-                vrr = "1" if db.adaptive_sync else "0"
+                if d.get("color_mode"):
+                    conf_line += f",cm,{d['color_mode']}"
+                vrr = "1" if d.get("adaptive_sync") else "0"
                 conf_line += f",vrr,{vrr}"
-                lua_props.append(f"    vrr = {vrr}")
-
                 lines_conf.append(conf_line)
-
-                if db.transform != "normal":
-                    t_code = transforms.get(db.transform, 0)
+                if d.get("transform", "normal") != "normal":
+                    t_code = transforms.get(d["transform"], 0)
                     lines_conf.append(f"monitor={name},transform,{t_code}")
-                    lua_props.append(f"    transform = {t_code}")
 
-                cmd = "on" if db.dpms else "off"
-                hyprctl(f"dispatch dpms {cmd} {db.name}")
-
-            lua_table = ",\n".join(lua_props)
-            lines_lua.append(f"hl.monitor({{\n{lua_table}\n}})")
-
-        backup_conf = []
-        if os.path.isfile(outputs_path):
-            backup_conf = load_text_file(outputs_path).splitlines()
-
-        outputs_path_lua = (
-            outputs_path.removesuffix(".conf") + ".lua"
-            if outputs_path.endswith(".conf")
-            else "~/.config/hypr/monitors.lua"
-        )
-
-        backup_lua = []
-        if os.path.isfile(outputs_path_lua):
-            backup_lua = load_text_file(outputs_path_lua).splitlines()
-
-        lines_conf = [header] + [ln.replace("#", "##") for ln in lines_conf]
-
-        save_list_to_text_file(lines_conf, outputs_path)
-        save_list_to_text_file(lines_lua, outputs_path_lua)
+        # 6. Atomic writes
+        atomic_write_file(lines_lua, outputs_path_lua)
+        if info["config_type"] == "conf" or (outputs_path and outputs_path.endswith(".conf")):
+            atomic_write_file(lines_conf, outputs_path_conf)
 
         hyprctl("reload")
 
-        backup = (backup_conf, backup_lua)
+        backup = (backup_conf, backup_lua, outputs_path_conf, outputs_path_lua)
 
         if create_confirm_win_callback:
-            create_confirm_win_callback(backup, outputs_path, config_dir, profile_name)
+            create_confirm_win_callback(backup, outputs_path_lua, config_dir, profile_name)
 
     @staticmethod
     def _get_header(source="nwg-displays"):
